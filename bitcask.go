@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -12,14 +11,11 @@ import (
 )
 
 var dirName = "files"
-var currentBatchSize int
-var currentFileSize int64
-var batch []struct {
-	key   string
-	value string
-}
 
-const threshold = 1024 * 4
+const fileSizeThreshold = 1024 * 1024 * 1024 * 2 // 2GB
+const batchSizeThreshold = 1024 * 1024 * 4       // 4MB
+const valueSizeThreshold = 1024 * 1024 * 3       // 3MB
+const loopCount = 1000
 
 var keyMap = make(map[string]struct {
 	filename  string
@@ -30,88 +26,95 @@ var keyMap = make(map[string]struct {
 func main() {
 	file, err := getFileToOperateOn()
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error0:", err)
 		return
 	}
 	defer file.Close()
 
 	writer := bufio.NewWriter(file)
+	var batchWriteRow string
+	var batchSize int
+	var totalOffset int64
+	startTime := time.Now()
 
-	// create a hasmap for key addressess offsets
-	keyValuePairs := []struct {
-		key   string
-		value string
-	}{
-		{"key1", "value1"},
-	}
-
-	for i := 0; i < 1000; i++ {
-		keyValuePairs = append(keyValuePairs, struct {
+	for i := 0; i < loopCount; i++ {
+		key := fmt.Sprintf("key%d", i+1)
+		value := fmt.Sprintf("value%s", strings.Repeat("a", valueSizeThreshold-7))
+		pair := struct {
 			key   string
 			value string
 		}{
-			fmt.Sprintf("key%d", i+1),
-			fmt.Sprintf("value%d", i+1),
-		})
-	}
-
-	startTime := time.Now()
-
-	writeRow := ""
-	for _, pair := range keyValuePairs {
-		offset, err1 := file.Seek(0, io.SeekEnd)
-		if err1 != nil {
-			fmt.Println("Error:", err1)
-			return
+			key,
+			value,
 		}
-		writeRow = buildWriteRow(pair.key, pair.value)
-		lineOffset := (len(writeRow)) - (len(pair.value))
-		totalOffset := int(offset) + lineOffset
-		filename := file.Name()
-		valueSize := len(pair.value)
+		writeRowWithoutNewLine := buildWriteRow(pair.key, pair.value)
+		writeRow := writeRowWithoutNewLine + "\n"
+		batchWriteRow += writeRow
+		batchSize += len(writeRow)
+
+		// Update offsets and metadata for each key
 		keyMap[pair.key] = struct {
 			filename  string
 			offset    int
 			valueSize int
 		}{
-			filename:  filename,
-			offset:    totalOffset,
-			valueSize: valueSize,
-		}
-		verified := verifyRow(writeRow)
-		if !verified {
-			fmt.Println("Error: row is not verified")
-			return
+			filename:  file.Name(),
+			offset:    int(totalOffset) + len(writeRowWithoutNewLine) - len(pair.value),
+			valueSize: len(pair.value),
 		}
 
-		err := writeToFile(file, writeRow+"\n")
-		if err != nil {
-			fmt.Println("Error:", err)
-			return
-		}
+		totalOffset += int64(len(writeRow))
 
-		fileInfo, err := file.Stat()
-		if err != nil {
-			fmt.Println("Error getting file info:", err)
-			return
-		}
-
-		if fileInfo.Size() > threshold {
-			// Rotate file logic here
-			if err := rotateFile(&file, &writer); err != nil {
-				fmt.Println("Error rotating file:", err)
+		if batchSize >= batchSizeThreshold || i == loopCount-1 {
+			_, err := writer.WriteString(batchWriteRow)
+			if err != nil {
+				fmt.Println("Error writing batch to file:", err)
 				return
 			}
+			writer.Flush()
+
+			batchWriteRow = "" // Reset the batch
+			batchSize = 0
+
+			// Check if a new file is needed and rotate if necessary
+			fileInfo, err := file.Stat()
+			if err != nil {
+				fmt.Println("Error getting file info:", err)
+				return
+			}
+			if fileInfo.Size() > fileSizeThreshold {
+				err = rotateFile(&file, &writer)
+				totalOffset = 0
+				if err != nil {
+					fmt.Println("Error rotating file:", err)
+					return
+				}
+			}
+		}
+	}
+
+	if len(batchWriteRow) > 0 {
+		_, err := writer.WriteString(batchWriteRow)
+		if err != nil {
+			fmt.Println("Error writing final batch to file:", err)
+			return
+		}
+		err = writer.Flush()
+		if err != nil {
+			fmt.Println("Error flushing final batch to file:", err)
+			return
 		}
 	}
 
 	endTime := time.Now() // Record the end time
 	fmt.Printf("Execution Time: %s\n", endTime.Sub(startTime))
+	/* fmt.Println(keyMap) */
+
 	// log all values from the keymap using getKeyValue function
 	for key := range keyMap {
 		_, err := getKeyValue(key)
 		if err != nil {
-			fmt.Println("Error:", err)
+			fmt.Println("Error1:", err)
 			return
 		}
 		/* fmt.Println("key:", key, "value:", value) */
@@ -149,7 +152,7 @@ func getKeyValue(key string) (string, error) {
 	if val, ok := keyMap[key]; ok {
 		value, err := getValueFromFileWithOffsetAndSize(val.filename, val.offset, val.valueSize)
 		if err != nil {
-			fmt.Println("Error:", err)
+			fmt.Println("Error2:", err)
 			return "", err
 		}
 		return value, nil
@@ -160,21 +163,22 @@ func getKeyValue(key string) (string, error) {
 func getValueFromFileWithOffsetAndSize(filename string, offset int, size int) (string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error3:", err)
 		return "", err
 	}
 	defer file.Close()
 
 	_, err = file.Seek(int64(offset), 0)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error4:", err)
 		return "", err
 
 	}
 	value := make([]byte, size)
 	_, err = file.Read(value)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error5:", offset, size, filename)
+		fmt.Println("Error5:", err)
 		return "", err
 	}
 	return string(value), nil
@@ -183,21 +187,21 @@ func getValueFromFileWithOffsetAndSize(filename string, offset int, size int) (s
 func getFileToOperateOn() (*os.File, error) {
 	fileName, err := findMostRecentFileBasedOnName(dirName)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error6:", err)
 		return nil, err
 	}
 	fullPath := fmt.Sprintf("%s/%s", dirName, fileName)
 
 	fileInfo, err := os.Stat(fullPath)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error7:", err)
 		return nil, err
 	}
 
-	if fileInfo.Size() > threshold {
+	if fileInfo.Size() > fileSizeThreshold {
 		fileName, err = createFileWithTimestamp(dirName)
 		if err != nil {
-			fmt.Println("Error:", err)
+			fmt.Println("Error8:", err)
 			return nil, err
 		}
 	}
